@@ -266,6 +266,11 @@ function WatchTab() {
     const [watchedOffset, setWatchedOffset] = React.useState(0)
     const [watchedTotal, setWatchedTotal] = React.useState(0)
     const [tab, setTab] = React.useState('daily')   // daily | taste | social | adv
+    // ⭐ 2.4.0「值班轮用哪个模型」：选项来自宿主 /models；读不到就退回两个手填框
+    const [models, setModels] = React.useState(null)   // null = 还没读；{ ok, providers, current, error }
+    const [dutyProv, setDutyProv] = React.useState(null)
+    const [dutyModel, setDutyModel] = React.useState(null)
+    const [dutyEffort, setDutyEffort] = React.useState(null)
       const [diag, setDiag] = React.useState(null)      // 诊断信息文本
       const [checks, setChecks] = React.useState(null)   // 环境自检结果 [{name, ok, detail, fix}]
       const [loginState, setLoginState] = React.useState('')
@@ -295,7 +300,17 @@ function WatchTab() {
         if (cfg && excl === null) setExcl((cfg.excludeWords || []).join('\n'))
         if (cfg && cLen === null) setCLen(cfg.commentLength || 'medium')
         if (cfg && fSort === null) setFSort(cfg.searchSort || 'pubdate')
+        if (cfg && dutyProv === null) setDutyProv(cfg.dutyProvider || '')
+        if (cfg && dutyModel === null) setDutyModel(cfg.dutyModel || '')
+        if (cfg && dutyEffort === null) setDutyEffort(cfg.dutyReasoningEffort || '')
       }, [cfg])
+
+      // ⭐ 2.4.0：可用模型目录 —— 只读一次（宿主里装了哪个 provider、有没有 key，这里给的就是真实那份）
+      React.useEffect(() => {
+        if (models !== null) return
+        jget('/models').then((r) => { if (alive.current) setModels(r || { ok: false, providers: [], error: '读不到' }) })
+          .catch((e) => { if (alive.current) setModels({ ok: false, providers: [], error: String(e?.message ?? e) }) })
+      }, [models])
 
       // ⭐ 收藏夹列表：只读一次，读不到就空列表（别每 5 秒重拉）
       // ⚠️ 2026-10-28：它要起一个 Python 去问 B站（1~3 秒）⇒ **延迟 1.2 秒再拉**，
@@ -837,6 +852,94 @@ function WatchTab() {
           (Array.isArray(st.missingDeps) && st.missingDeps.length)
             ? h('div', { 'data-bd-note': '' }, '还缺这几项：' + st.missingDeps.join(' / ') + '（qrcode = 画登录二维码用的）—— 点一次「重装主依赖」就会补上')
             : null,
+
+        /* ── 值班轮用哪个模型（2.4.0） ── */
+        h('div', { 'data-bd-sec': '', 'data-bd-group': 'adv', 'data-bd-away': tab === 'adv' ? undefined : '' },
+          h('div', { 'data-bd-h': '' }, '值班轮用哪个模型'),
+          h('div', { 'data-bd-note': '' },
+            '留空 = 跟着主界面当前选的模型走（跟以前一样）。选了具体的，就固定用它 —— 你在主界面换成别的也不影响这一轮。'),
+          (() => {
+            const providers = (models && Array.isArray(models.providers)) ? models.providers : []
+            const cur = (models && models.current) || null
+            const curName = cur && cur.provider && cur.model ? `${cur.provider} / ${cur.model}` : '（读不到主界面的选择）'
+            // 选中的 provider 名（空 = 跟随主界面）
+            const provSel = String(dutyProv ?? '')
+            const provRow = providers.find((p) => p.id === provSel) || null
+            const modelRows = provRow ? (provRow.models || []) : []
+            const eff = modelRows.find((m) => m.id === String(dutyModel ?? ''))
+            const efforts = (eff && eff.reasoning && Array.isArray(eff.reasoning.efforts)) ? eff.reasoning.efforts : []
+            // ⚠️ 服务端有"空值不覆盖"的保护（防自动保存把人设清空）⇒ 想回到"跟随主界面"必须显式带 clear，
+            //    否则选「跟随主界面」后这两个空串会被静默丢掉，界面上看着改了、实际还钉着上一个 ✗
+            const save = (p, m, e) => {
+              const blanks = ['dutyProvider', 'dutyModel', 'dutyReasoningEffort'].filter((k, i) => ![p, m, e][i])
+              patch({
+                dutyProvider: p || '', dutyModel: m || '', dutyReasoningEffort: e || '',
+                ...(blanks.length ? { clear: blanks } : {}),
+              }, '值班轮模型')
+            }
+            return h('div', { 'data-bd-sec': '' },
+              h('div', { 'data-bd-row': '' },
+                h('div', { 'data-bd-label': '' }, '提供方'),
+                providers.length
+                  ? h('select', {
+                    'data-bd-input': '', value: provSel,
+                    onChange: (e) => {
+                      const p = e.target.value
+                      setDutyProv(p)
+                      // 换 provider ⇒ 模型清空（重选；不能留上一个 provider 的模型名）
+                      const first = p ? ((providers.find((x) => x.id === p) || {}).models || [])[0] : null
+                      const m = p && first ? first.id : ''
+                      setDutyModel(m); setDutyEffort('')
+                      save(p, m, '')
+                    },
+                  },
+                    h('option', { value: '' }, '跟随主界面（现在：' + curName + '）'),
+                    providers.map((p) => h('option', { key: p.id, value: p.id }, `${p.name || p.id}（${p.id}）`)))
+                  // 目录读不到 ⇒ 退回手填，别把路堵死
+                  : h('input', {
+                    'data-bd-input': '', placeholder: 'provider id，如 deepseek / workbuddy；留空 = 跟随主界面',
+                    value: provSel, onChange: (e) => setDutyProv(e.target.value),
+                  })),
+              (providers.length && provSel)
+                ? h('div', { 'data-bd-row': '' },
+                  h('div', { 'data-bd-label': '' }, '模型'),
+                  h('select', {
+                    'data-bd-input': '', value: String(dutyModel ?? ''),
+                    onChange: (e) => { const m = e.target.value; setDutyModel(m); setDutyEffort(''); save(provSel, m, '') },
+                  },
+                    h('option', { value: '' }, '（这个 provider 的默认）'),
+                    modelRows.map((m) => h('option', { key: m.id, value: m.id }, `${m.name || m.id}（${m.id}）`))))
+                : null,
+              (!providers.length && provSel)
+                ? h('div', { 'data-bd-row': '' },
+                  h('div', { 'data-bd-label': '' }, '模型'),
+                  h('input', {
+                    'data-bd-input': '', placeholder: 'model id，如 deepseek-flash；留空 = 用这个 provider 的默认',
+                    value: String(dutyModel ?? ''), onChange: (e) => setDutyModel(e.target.value),
+                  }),
+                  h('button', { 'data-bd-btn': '', onClick: () => save(String(dutyProv || ''), String(dutyModel || ''), '') }, '保存'))
+                : null,
+              efforts.length
+                ? h('div', { 'data-bd-row': '' },
+                  h('div', { 'data-bd-label': '' }, '推理力度'),
+                  h('select', {
+                    'data-bd-input': '', value: String(dutyEffort ?? ''),
+                    onChange: (e) => { const v = e.target.value; setDutyEffort(v); save(provSel, String(dutyModel || ''), v) },
+                  },
+                    h('option', { value: '' }, '用模型的默认'),
+                    efforts.map((v) => h('option', { key: v, value: v }, v))))
+                : null,
+              h('div', { 'data-bd-note': '' },
+                models === null ? '正在读这台机器上可用的模型…'
+                  : (models.ok === false
+                    ? ('读不到模型目录（' + (models.error || '未知原因') + '）—— 上面两个框可以手动填。')
+                    : (provSel
+                      ? '这一轮固定用 ' + provSel + ' / ' + (String(dutyModel || '') || '（默认）') + '；主界面换模型不影响它。'
+                      : '这一轮跟着主界面走 —— 主界面换成哪个，它就用哪个。'))),
+              (models && models.ok && !providers.length)
+                ? h('div', { 'data-bd-note': '' }, '这台机器上还没装出任何可用的 provider（先登录 / 装 provider 插件）。')
+                : null)
+          })()),
 
         /* ── 它是怎么干活的（给他看的） ── */
         h('div', { 'data-bd-sec': '', 'data-bd-group': 'adv', 'data-bd-away': tab === 'adv' ? undefined : '' },

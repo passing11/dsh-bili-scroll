@@ -36,6 +36,129 @@ import { resolveUid } from './lib/uid.mjs'
 import { loadCred as dmCred, listSessions as dmList, fetchMsgs as dmFetch } from './lib/dm.mjs'
 import { ensureUv } from './lib/uvfetch.mjs'
 
+// ⭐⭐ 2026-10-29（用户实测：切到 WorkBuddy 模型后值班轮直接死）：
+//    值班轮跑的是**我们自己的** `bili-duty` profile（dsh-base + dsh-headless + 那层最小权限 patch），
+//    而用户正在用的模型是第三方 provider 插件（`dsh-connect-workbuddy`）注册的 —— 那个插件只装在
+//    **桌面 profile 的 node_modules 里**，`bili-duty` 里没有 ⇒ 那一轮报
+//    `NO_ADAPTER: no adapter registered for provider "workbuddy"`（或者装上但没目录 ⇒ `UNKNOWN_MODEL`），
+//    1 秒就 exit 1，报告里只剩一行 code=1。
+//    ⇒ 修法：overlay 里**按需**把当前选中的那个 provider 插件也插进来（不选它就不插，一点不多给）：
+//      · `name` 用 `file:///<绝对路径>/lib/index.js` —— 实测这样不需要在 bili-duty 里放 node_modules
+//        软链/junction（软链会被模板覆盖留着、也说不清是谁建的）；
+//      · `config` 从**用户自己 profile 的 cordis.patch.yml 里那条同名条目原样搬过来** —— 少一样都不行：
+//        只给插件不给 config ⇒ 适配器注册了但没模型目录 ⇒ `UNKNOWN_MODEL`（实测）。
+//    ⚠️ 只搬 config，不搬 client / 界面那些条目（值班轮没有 UI）。
+const EXTERNAL_PROVIDER_PKG = {
+  // provider id（agent-default-model 里那个字符串）→ 注册它的 npm 包名
+  workbuddy: 'dsh-connect-workbuddy',
+  'workbuddy-global': 'dsh-connect-workbuddy',
+  codebuddy: 'dsh-connect-workbuddy',
+  // 2026-10-29 用户切到 Trae 时又踩了同一个坑 —— trae 的包名/provider id 都不一样，
+  // 而且它有国内版 / 国际版 / 企业版三个 id（见 dsh-connect-trae/lib 里的 PROVIDER 常量）。
+  trae: 'dsh-connect-trae',
+  'trae-global': 'dsh-connect-trae',
+  'trae-enterprise': 'dsh-connect-trae',
+}
+
+/** 把一个绝对路径写成 YAML 里的 file URL（Windows 盘符也要写成 file:///C:/…）。 */
+const toFileUrl = (abs) => 'file:///' + String(abs).replace(/\\/g, '/').replace(/^\/+/, '')
+
+/**
+ * 找到某个 provider 插件包在磁盘上的位置。
+ * 先看各 profile 的 node_modules（用户平时是在桌面 profile 里装的），再看 <家>/node_modules。
+ * @returns {{ pkg: string, dir: string, entry: string } | null}
+ */
+const findProviderPackage = (home, pkgs) => {
+  const profilesDir = join(home, 'profiles')
+  const roots = []
+  try {
+    for (const d of readdirSync(profilesDir, { withFileTypes: true })) {
+      if (d.isDirectory()) roots.push(join(profilesDir, d.name, 'node_modules'))
+    }
+  } catch { /* 没有 profiles 目录就只看家目录 */ }
+  roots.push(join(home, 'node_modules'))
+  for (const root of roots) {
+    for (const pkg of pkgs) {
+      const dir = join(root, pkg)
+      if (!existsSync(join(dir, 'package.json'))) continue
+      let entry = join(dir, 'lib', 'index.js')
+      try {
+        const main = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))?.main
+        if (main) entry = join(dir, main)
+      } catch { /* 读不出来就用默认的 lib/index.js */ }
+      if (existsSync(entry)) return { pkg, dir, entry }
+    }
+  }
+  return null
+}
+
+/**
+ * 从各 profile 的 cordis.patch.yml 里把某条 loader 条目的 `config:` 正文原样抠出来。
+ * 优先选**含有当前模型**的那一份（同一台机器上可能有好几个 profile）。
+ * @returns {{ id: string, body: string[] } | null}
+ */
+const findProviderConfig = (home, pkgs, wantModel) => {
+  const profilesDir = join(home, 'profiles')
+  const hits = []
+  let dirents = []
+  try { dirents = readdirSync(profilesDir, { withFileTypes: true }) } catch { return null }
+  for (const d of dirents) {
+    if (!d.isDirectory()) continue
+    const file = join(profilesDir, d.name, 'cordis.patch.yml')
+    if (!existsSync(file)) continue
+    let lines = []
+    try { lines = readFileSync(file, 'utf8').split(/\r?\n/) } catch { continue }
+    for (let i = 0; i < lines.length; i++) {
+      const m = /^- id:\s*(\S+)\s*$/.exec(lines[i])
+      if (!m) continue
+      let name = ''
+      let cfgAt = -1
+      for (let j = i + 1; j < lines.length && !/^- /.test(lines[j]); j++) {
+        if (/^  name:/.test(lines[j])) name = lines[j].slice(7).trim().replace(/^['"]|['"]$/g, '')
+        if (/^  config:\s*$/.test(lines[j])) { cfgAt = j + 1; break }
+      }
+      if (cfgAt < 0) continue
+      if (!pkgs.includes(m[1]) && !pkgs.includes(name)) continue
+      const body = []
+      for (let k = cfgAt; k < lines.length; k++) {
+        const ln = lines[k]
+        if (ln.trim() === '' || !/^\s{4,}/.test(ln)) break
+        body.push(ln)
+      }
+      if (body.length) hits.push({ id: m[1], body })
+    }
+  }
+  if (!hits.length) return null
+  if (wantModel) {
+    const hit = hits.find((h) => h.body.some((ln) => new RegExp(`id:\\s*['"]?${wantModel.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['"]?\\s*$`).test(ln)))
+    if (hit) return hit
+  }
+  return hits[0]
+}
+
+/**
+ * 生成「把当前选中的第三方 provider 也装进值班轮」的那几行 overlay。
+ * 认不出来的 provider（就是 DSH 自带的那几个）⇒ 返回空数组，跟以前一模一样。
+ * @returns {string[]}
+ */
+export const externalProviderOverlay = (home, provider, model) => {
+  const pkgs = provider ? EXTERNAL_PROVIDER_PKG[String(provider)] : null
+  if (!pkgs) return []
+  const found = findProviderPackage(home, [pkgs])
+  if (!found) return []
+  const cfg = findProviderConfig(home, [pkgs], model)
+  if (!cfg) return []   // 没有 config 就没模型目录（实测会 UNKNOWN_MODEL）⇒ 不如不写，让诊断文案去解释
+  const out = [
+    '- insert:',
+    '    - id: ' + cfg.id,
+    "      name: '" + toFileUrl(found.entry) + "'",
+    '      config:',
+  ]
+  for (const ln of cfg.body) out.push('    ' + ln)
+  out.push('')
+  return out
+}
+
 export const name = 'bili-scroll'
 // attachments / llm 故意**不**列进 inject：它们只在看图时才用 ctx.get 取，
 // 取不到就把图降级成文字说明；列进来会让没有这两个服务的宿主直接装不上。
@@ -118,6 +241,13 @@ export const Config = !z ? undefined : z.object({
     commentLength: z.string().default('medium').extra('volatile', true),
     /** 这一轮最多细看几条（读字幕 / 评论）；其余只扫标题，默认 8 */
     fetchPerRound: z.natural().default(8).extra('volatile', true),
+    /** ⭐⭐ 2.4.0：**值班轮用哪个模型** —— 留空 = 跟随主界面当前选择（跟以前一样）。
+     *  填了 provider + model ⇒ 这一轮就用这个，**跟你主界面选什么无关**（主界面换模型不会影响它）。
+     *  ⚠️ 只填一半（比如只填 provider）不算数，按"跟随主界面"处理 —— 半截配置比没有更迷惑。 */
+    dutyProvider: z.string().default('').extra('volatile', true),
+    dutyModel: z.string().default('').extra('volatile', true),
+    /** 可选：推理力度（只对声明了 reasoning 的模型有意义；留空 = 用模型自己的默认） */
+    dutyReasoningEffort: z.string().default('').extra('volatile', true),
 })
 
 /**
@@ -268,6 +398,8 @@ function reportMeta() {
     keywords: [], commentPerRound: 1, mentionName: '', pythonPath: 'python', dshBin: '', headlessProfile: 'headless', overlayMcp: true, workspace: '', reportLevel: 'full', replyToComments: false, replyPerRound: 1, favFolderId: 0,
     // ⭐ 2.3.0：手动轮 / 抓取量 / 排除词 / 评论长度 —— 少一项 normalize 就会把用户存的值丢掉
     manualMax: 3, manualCooldownMin: 10, searchSort: 'pubdate', searchPages: 2, fetchPerRound: 8, excludeWords: [], commentLength: 'medium',
+    // ⭐ 2.4.0：值班轮自己的模型（空 = 跟随主界面）
+    dutyProvider: '', dutyModel: '', dutyReasoningEffort: '',
   }
   const normalize = (src, base) => {
     const out = { ...base }
@@ -315,6 +447,12 @@ function reportMeta() {
     if ('replyPerRound' in p) p.replyPerRound = Math.max(1, Math.min(Number(p.replyPerRound) || 1, 10))
     if ('favFolderId' in p) p.favFolderId = Math.max(0, Math.floor(Number(p.favFolderId) || 0))
     if ('commentPerRound' in p) p.commentPerRound = Math.max(0, Math.min(Number(p.commentPerRound) || 0, 20))
+    // ⭐ 2.4.0「值班轮用哪个模型」：两个都给了才算钉住；**留空是合法值**（= 跟随主界面）
+    //   ⚠️ 不校验它在不在目录里 —— provider/model 名由宿主 llm 服务说了算，这里硬卡会把
+    //      "刚装上、目录还没热"的正常值误杀 ✗。错名字的代价是那一轮报错，不是写坏配置。
+    if ('dutyProvider' in p) p.dutyProvider = String(p.dutyProvider ?? '').trim().slice(0, 120)
+    if ('dutyModel' in p) p.dutyModel = String(p.dutyModel ?? '').trim().slice(0, 160)
+    if ('dutyReasoningEffort' in p) p.dutyReasoningEffort = String(p.dutyReasoningEffort ?? '').trim().slice(0, 40)
     return p
   }
 
@@ -835,7 +973,8 @@ function reportMeta() {
     name: 'bili_config',
     description: '读 / 改「刷B站」的设置。不给 `patch` 就是读；给了就改（只认 schema 里的字段）。\n'
       + '例：`{"perDay":5,"peakValley":true,"noon":true,"night":true,"autoComment":false,"transcribe":false,"keywords":["DeepSeek Harness"]}`；'
-      + '私信投递：`{"dmMode":"only","dmUid":12345678}`（dmMode = off / only / both）。',
+      + '私信投递：`{"dmMode":"only","dmUid":12345678}`（dmMode = off / only / both）；'
+      + '值班轮用哪个模型：`{"dutyProvider":"workbuddy","dutyModel":"glm-5.3"}`（两个都给才算钉住；都留空 = 跟随主界面）。',
     parameters: { patch: { type: 'object', additionalProperties: true, description: '要改的字段（可省）' } },
     async execute(args) {
       let host = null
@@ -909,11 +1048,28 @@ function reportMeta() {
   //    桌面版用户的 profile 是 desktop ⇒ 升级失败，反而把 0.1.7 装进 web 里，越修越乱 ✓
   //    现在从"自己这个模块的真实路径"里取 profile 名：挂载点是 ~/.dsh/profiles/<名字>/node_modules/<包>/
   const ownProfileName = (() => {
+    // ⭐ 2026-10-30：**先从环境变量取** —— 插件用 `link:` 装（指向工作区里的本地目录）时，
+    //    模块路径里根本没有 `/profiles/<名字>/node_modules/` 这一段 ⇒ 只认路径会退回 'web'，
+    //    一键升级就会把包装到 web profile 里去（桌面版用户直接踩）。DSH 会给它启动的进程设
+    //    `DSH_PROFILE`，这个值才是"我到底是哪个 profile 加载的"的权威答案。
+    try {
+      const env = String(process.env.DSH_PROFILE || '').trim()
+      if (env) return env
+    } catch { /* 没有环境变量就看路径 */ }
     try {
       const u = String(import.meta.url || '').replace(/\\/g, '/')
       const m = u.match(/\/profiles\/([^/]+)\/node_modules\//)
       return m ? m[1] : ''
     } catch { return '' }
+  })()
+  // ⭐ 2026-10-30：这一份是不是 `link:` 进来的本地目录（而不是 npm 装进 profile 的那份）。
+  //    是的话**一键升级必须拦住**：`add dsh-bili-scroll` 会把链接换成 npm 上的旧版，
+  //    本地改的 2.3.1 / 2.4.0 就又被覆盖了（2026-10-29 就是这么丢的）。
+  const linkedInstall = (() => {
+    try {
+      const u = String(import.meta.url || '').replace(/\\/g, '/')
+      return !/\/profiles\/[^/]+\/node_modules\//.test(u)
+    } catch { return false }
   })()
   const profileArg = ownProfileName || 'web'
   // ⭐ 顺带：把"我是从哪个 profile 加载的"报出来，排障时一眼看得出
@@ -926,6 +1082,13 @@ function reportMeta() {
   let ghUpdateCache = null
   const runUpgrade = () => {
     if (upgrading) return { ok: true, busy: true, log: installLogFile, hint: '正在升级，别重复点' }
+    // ⭐ 2026-10-30：link: 装的本地副本**不许一键升级** —— 那一下会用 npm 上的包把链接顶掉，
+    //    本地改动（2.3.1 的 provider 注入、2.4.0 的值班轮模型）直接消失。要升级就去那个目录里自己处理。
+    if (linkedInstall) {
+      appendInstall('\n=== 这一份是从本地目录 link 进来的（' + pluginDir + '），已拦下"一键升级" ===\n')
+      appendInstall('=== 为什么：add 会把链接换成 npm 上的包，本地改动就没了。要更新请到那个目录里自己改/发布。 ===\n')
+      return { ok: false, blocked: true, log: installLogFile, hint: '本地 link 的副本不能一键升级（会覆盖本地改动）' }
+    }
     upgrading = true
     let spec = lastUpdateSource === 'github' ? 'github:c1overzz/dsh-bili-scroll' : 'dsh-bili-scroll'
     ;(async () => {
@@ -1402,17 +1565,39 @@ function reportMeta() {
     //    ⇒ overlay 里补一条 agent-default-model，**优先跟随用户当前选的模型**；拿不到就不写（保持原行为）✓
     try {
       const sel = ctx.get('agentDefaultModel')?.currentSelection?.() ?? null
-      const selProvider = sel?.provider ?? sel?.providerId
-      const selModel = sel?.model ?? sel?.modelId
+      // ⭐⭐ 2.4.0：**值班轮自己的模型**（设置页「值班轮用哪个模型」）优先；
+      //    两个字段都填了才算数（半截配置 = 跟随主界面，免得用户以为设了其实没设）。
+      const ownProvider = String(cfg.dutyProvider || '').trim()
+      const ownModel = String(cfg.dutyModel || '').trim()
+      const pinned = ownProvider && ownModel
+      const selProvider = pinned ? ownProvider : (sel?.provider ?? sel?.providerId)
+      const selModel = pinned ? ownModel : (sel?.model ?? sel?.modelId)
+      const effort = pinned
+        ? String(cfg.dutyReasoningEffort || '').trim()
+        : String(sel?.reasoningEffort || '').trim()
       if (selProvider && selModel) {
         yml.push(
           '- id: agent-default-model',
           '  config:',
           '    provider: ' + String(selProvider),
           '    model: ' + String(selModel),
-          ...(sel.reasoningEffort ? ['    reasoningEffort: ' + String(sel.reasoningEffort)] : []),
+          ...(effort ? ['    reasoningEffort: ' + String(effort)] : []),
           '',
         )
+        // ⭐⭐ 2026-10-29：选中的是**第三方 provider 插件**（WorkBuddy 这类）时，值班轮得自己把它插进来 ——
+        //    光指 agent-default-model 不够：那个适配器只在用户自己的 profile 里装着，bili-duty 里没有 ⇒
+        //    `NO_ADAPTER: no adapter registered for provider "workbuddy"`，那一轮 1 秒就死。
+        //    见文件顶部 externalProviderOverlay 的注释（含实测的两种失败形态）。
+        const extra = externalProviderOverlay(dirname(stateDir), selProvider, selModel)
+        if (extra.length) {
+          yml.push(...extra)
+          log('值班轮模型来源：' + selProvider + '（是插件 provider ⇒ 这一轮一并装上它）')
+        }
+        // ⭐ 2.4.0：日志里说清楚这一轮用的是"你自己钉的"还是"跟主界面走的" ——
+        //    不然用户改完设置页、下一轮还报 NO_ADAPTER，没法判断到底哪一边没生效
+        log(pinned
+          ? `值班轮模型：${selProvider}/${selModel}（设置页钉住的，不跟主界面）`
+          : `值班轮模型：${selProvider}/${selModel}（跟随主界面）`)
       }
     } catch { /* 老版本没有这个服务 —— 不写就退回原行为 */ }
     if (cfg.overlayMcp) {
@@ -2575,6 +2760,28 @@ function reportMeta() {
       // ⭐ 让设置页能显示"装到哪了"（陌生人原来只看到一句"后台在装" ✗）
       installTail: (() => { try { return readFileSync(installLogFile, 'utf8').slice(-1400) } catch { return '' } })(),
       report: join(outDir, `${today}.md`),
+      // ⭐ 2.4.0：这一轮**实际**会用哪个模型（设置页钉住的 > 主界面选择），只读、不花请求
+      dutyModelNow: (() => {
+        try {
+          const pinned = String(cfg.dutyProvider || '').trim() && String(cfg.dutyModel || '').trim()
+          if (pinned) {
+            return {
+              provider: String(cfg.dutyProvider).trim(),
+              model: String(cfg.dutyModel).trim(),
+              reasoningEffort: String(cfg.dutyReasoningEffort || '').trim(),
+              source: 'pinned',
+            }
+          }
+          const sel = ctx.get('agentDefaultModel')?.currentSelection?.() ?? null
+          if (!sel) return null
+          return {
+            provider: String(sel.provider ?? sel.providerId ?? ''),
+            model: String(sel.model ?? sel.modelId ?? ''),
+            reasoningEffort: String(sel.reasoningEffort ?? ''),
+            source: 'main',
+          }
+        } catch { return null }
+      })(),
       log: logFile,
     }
   }
@@ -2628,6 +2835,47 @@ function reportMeta() {
       return sendJson(res, 200, { ok: true, config: cfg, windows: WINDOWS, home: stateDir })
     }
 
+    // ⭐⭐ 2.4.0「值班轮用哪个模型」：把宿主当前**可用**的 provider / model 列出来给设置页做下拉。
+    //    走宿主自己的 llm 目录（`ctx.get('llm')` 的 listProviders() / listModels(provider)），
+    //    **不猜、不硬编码** —— 装了哪个 provider 插件、登没登录、有没有 key，这里给出的就是真实可用的那份。
+    //    取不到（老版本宿主没有这个服务 / 插件注入没到位）⇒ ok:false + 理由，设置页退回手动填两个框。
+    if (req.method === 'GET' && path === '/api/bili-duty/models') {
+      const out = { ok: false, providers: [], current: null, error: '' }
+      try {
+        const am = ctx.get('agentDefaultModel') ?? null
+        const sel = am?.currentSelection?.() ?? null
+        out.current = sel ? {
+          provider: String(sel.provider ?? sel.providerId ?? ''),
+          model: String(sel.model ?? sel.modelId ?? ''),
+          reasoningEffort: String(sel.reasoningEffort ?? ''),
+        } : null
+        const llm = ctx.get('llm') ?? null
+        if (!llm || typeof llm.listProviders !== 'function') {
+          out.error = '这个宿主版本没有可读的模型目录（llm 服务不可用）—— 可以先手动填 provider / model'
+        } else {
+          // ⚠️ listProviders() 在宿主的类型里是**同步**返回数组，但别赌：Promise.resolve 兜一层，
+          //    将来它改成异步也不会把设置页打挂（这一步只影响下拉选项，失败必须能退回手填）
+          const provList = await Promise.resolve(llm.listProviders?.() ?? [])
+          const rows = await Promise.all((Array.isArray(provList) ? provList : []).map(async (p) => {
+            let models = []
+            try {
+              const list = await llm.listModels(p.id)
+              models = (list || []).map((m) => ({
+                id: String(m.id),
+                name: String(m.name || m.id),
+                inputModalities: Array.isArray(m.inputModalities) ? m.inputModalities.map(String) : [],
+                reasoning: m.reasoning ? { efforts: Array.isArray(m.reasoning.efforts) ? m.reasoning.efforts.map(String) : [] } : null,
+              }))
+            } catch (e) { models = [] }   // 单个 provider 读不出模型不影响别的
+            return { id: String(p.id), name: String(p.name || p.id), models }
+          }))
+          out.providers = rows.filter((p) => p.models.length || p.id)
+          out.ok = true
+        }
+      } catch (e) { out.ok = false; out.error = String(e?.message ?? e) }
+      return sendJson(res, 200, out)
+    }
+
     if (req.method === 'POST' && path === '/api/bili-duty/config') {
       const body = await readBody(req)
       const patch = {}
@@ -2641,6 +2889,11 @@ function reportMeta() {
       //    以前照单全收 ⇒ 用户配好的人设/关键词"过一会儿自己变空" ✗
       //    现在：**空值不覆盖已有值**（真要清空，得显式带 `clear: ['keywords', …]`）✓
       const clears = Array.isArray(body && body.clear) ? body.clear : []
+      // ⭐ 2.4.0：`duty*` 这三项**空串就是合法值**（= 跟随主界面），不能被上面那道"空值不覆盖"挡住 ——
+      //    否则用户在设置页选回「跟随主界面」后，那两个空串被静默丢掉，看着改了、实际还钉着上一个 ✗
+      for (const k of ['dutyProvider', 'dutyModel', 'dutyReasoningEffort']) {
+        if (k in body && String(body[k] ?? '') === '' && !clears.includes(k)) clears.push(k)
+      }
       const isBlank = (v) => (v === '' || v === null || v === undefined || (Array.isArray(v) && v.length === 0))
       //    ⚠️ 光看内存里的 cfg 不够（宿主设置层覆盖过它）⇒ 再把 config.json 里那份也算上 ✓
       const savedForGuard = (() => { try { return readJson(join(stateDir, 'config.json'), {}) || {} } catch { return {} } })()

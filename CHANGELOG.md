@@ -1,3 +1,68 @@
+## 2.4.1 — 2026-10-30
+
+**这一版只修一件事：本地 `link:` 装的副本，不再被「一键升级」覆盖掉。**
+
+2.4.0 的改动之所以会凭空消失，是因为插件是 npm 装进 profile 的，
+后续一次 `dsh plugin add` / pnpm install 就把 node_modules 里那份手改版本换回了 npm 上的 2.3.0。
+现在改成 `link:` 到本地目录（`E:\dsh插件生成\dsh-bili-scroll`），pnpm install 不会再去动它。
+
+配套改了两处：
+
+- `ownProfileName` 优先读 `DSH_PROFILE`：`link:` 装的模块路径里没有 `/profiles/<名字>/node_modules/`
+  这一段，只认路径会退回 `web`，一键升级就会把包装错 profile（桌面版用户直接踩）。
+- 新增 `linkedInstall` 判定：**是本地 link 进来的，`runUpgrade` 直接拦下**，并在 `install.log` 里写清
+  为什么 —— 那一下 `add dsh-bili-scroll` 会把链接换成 npm 上的旧版，本地改动全丢。
+
+## 2.4.0 — 2026-10-29
+
+**这一版加一件事：值班轮可以固定用自己的模型，不再被主界面的选择牵着走。**
+
+以前只有一条路 —— 值班轮永远跟着你在主界面选的那个模型。想让它平时用便宜/快的模型刷 B站、
+自己聊天又用另一个，做不到；主界面一换，下一轮就跟着变。
+
+现在「设置 → 高级 → 值班轮用哪个模型」里可以钉住：选一个 provider + 模型（可选推理力度），
+之后**不管主界面选什么**，那一轮都用这个。留空 = 还是跟主界面走（跟以前完全一样）。
+
+- **选项是真实的目录**，不是硬编码：下拉里列的是宿主 `llm` 服务当前真能用的 provider / 模型
+  （装了哪个 provider 插件、登没登录、有没有 key，给的就是那份）。读不到就退回两个手填框，
+  不会把路堵死。
+- **两个都填了才算钉住**：只填 provider 不填模型 ⇒ 按"跟随主界面"处理（半截配置比没有更迷惑）。
+- **留空是合法值**：`dutyProvider` / `dutyModel` / `dutyReasoningEffort` 的空串要显式走
+  `clear`，否则会被服务端那道"空值不覆盖已有值"的保护静默丢掉 —— 界面上看着改了、实际还钉着上一个。
+- 选中的是**第三方 provider 插件**（WorkBuddy / Trae 这类）时，上面那套"把 provider 插件一起
+  insert 进值班轮"照样生效，这次钉住的值也走同一条路。
+- `duty.log` 每轮会写清楚这次用的是"设置页钉住的"还是"跟随主界面"的 —— 排查时不用猜。
+- `bili_config` 也能改：`{"dutyProvider":"workbuddy","dutyModel":"glm-5.3"}`。
+- `status` 多一项 `dutyModelNow`（`source: pinned | main`），设置页和状态接口都能看到这一轮实际用哪个。
+
+**同一版还修掉一件事：切到第三方 provider（WorkBuddy / Trae）后值班轮跑不起来。**
+
+（本地版当初单独记作 2.3.1，与上游 2.3.1 撞号，这里并入 2.4.0。）
+
+**症状**：主界面把模型选成 WorkBuddy，点「现在跑一轮」，1 秒就结束，报告里只剩一行 `code=1`；
+`duty.log` 里是 `dsh: NO_ADAPTER: no adapter registered for provider "workbuddy"`。
+
+**根因**：值班轮跑的是本插件自己铺的 `bili-duty` profile（最小权限那层）。它只把
+`agent-default-model` 指到了用户选中的 provider，但**注册这个 provider 的适配器是个插件**
+（`dsh-connect-workbuddy`），那个插件只装在用户自己的 profile 里 ⇒ 值班轮里没有 ⇒ 启动即退。
+
+**修法**：铺 overlay 时，如果选中的是**第三方 provider 插件**（认这几个 id），就把那个包也 `insert`
+进这一轮，并把用户 profile 里那条同名的 `config:` **原样搬过来**：
+
+| provider id | 包名 |
+| --- | --- |
+| `workbuddy` / `workbuddy-global` / `codebuddy` | `dsh-connect-workbuddy` |
+| `trae` / `trae-global` / `trae-enterprise` | `dsh-connect-trae` |
+
+- 只插插件、不给 config ⇒ 适配器注册了但没有模型目录 ⇒ `UNKNOWN_MODEL`（实测）；
+- 插件条目用 `file:///<绝对路径>/lib/index.js` 引，**不必**在 `bili-duty` 里放 node_modules 软链/junction；
+- 认不出来的 provider（就是 DSH 自带的）⇒ 一行都不加，行为跟以前完全一样。
+
+顺带把 `NO_ADAPTER` 的诊断文案补了一句：这版起这件事本该自动处理，还看到那句就说明
+「高级 → headless profile」里手填了别的 profile，或那个 provider 插件不是本插件认得的包。
+
+**升级**：`dsh plugin --profile desktop add dsh-bili-scroll`，然后**完全退出 dsh 再打开**。
+
 ## 2.3.1 — 2026-10-28
 
 **这一版只修设置页的手感，四个都很小，但都能让人以为插件坏了。**
