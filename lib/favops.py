@@ -49,23 +49,21 @@ async def folders():
 
 async def add(bvid, fid):
     from bilibili_api import video as ba_video
-    # ⭐ 必须在 add() 里也 import favorite_list —— 它只在 folders() 里 import 过一次，
-    #    而两个函数各自是独立作用域，所以下面两行用法会 NameError：
-    #    「自动收藏永远失败」的根因就是这个（issue #76）。
-    #    报错信息长得像"收藏接口坏了"，但实际是这个名字根本没绑定。
-    from bilibili_api import favorite_list
+    # ⭐ 收藏是 **Video 上的动作**（API operate/favorite，type=2 视频），不是收藏夹上的动作。
+    #    老写法有两处跟 bilibili-api-python 17.4.x 对不上，导致「自动收藏 0/3」：
+    #      ① favorite_list.FavoriteList(aid, credential=cred)
+    #         第一个位置参数是 type_（收藏夹类型），不是 aid ⇒ aid 被当成类型、
+    #         media_id 仍是 None ⇒ 抛「视频收藏夹需要 media_id」；
+    #      ② favorite_list.FavoriteListResource —— 这个类在 17.4.x 里根本不存在。
+    #    正确写法就是下面这一行（内部自己取 aid、自己拼 add_media_ids）。
     cred, _ = load()
     v = ba_video.Video(bvid=bvid, credential=cred)
-    info = await v.get_info()
-    aid = int(info['aid'])
-    # 保持原有行为：先取一次收藏夹信息（原代码就有，不要顺手删）
-    res = await favorite_list.FavoriteList(aid, credential=cred).get_info()
     try:
-        await favorite_list.FavoriteListResource(aid, type_=2, credential=cred).add(fid)
+        await v.set_favorite(add_media_ids=[int(fid)])
     except Exception as error:  # noqa: BLE001
         msg = str(error)
-        # 已经收藏过不算失败
-        if '已经' in msg or 'already' in msg.lower():
+        # 已经收藏过不算失败（API 那边可能报 11202 / "已经收藏过了"）
+        if '已经' in msg or 'already' in msg.lower() or '11202' in msg:
             out({'ok': True, 'already': True})
         out({'ok': False, 'error': msg[:200]})
     out({'ok': True})

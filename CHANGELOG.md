@@ -1,3 +1,24 @@
+## 2.4.4 — 2026-10-31
+
+**修「自动收藏永远 0/3」：`lib/favops.py` 的收藏调用跟 `bilibili-api-python 17.4.x` 对不上。**
+
+老代码在 `add()` 里做两件 17.4.x 上都不成立的事：
+
+1. `favorite_list.FavoriteList(aid, credential=cred)` —— `FavoriteList.__init__` 的第一个位置参数是 `type_`（收藏夹类型），`media_id` 在第二个。所以 aid 被当成类型塞进去、`media_id` 还是 `None`，构造完一取信息就抛 `视频收藏夹需要 media_id`（`favorite_list.py:119`）。
+2. `favorite_list.FavoriteListResource(aid, type_=2, ...).add(fid)` —— **这个类在 17.4.x 里根本不存在**（`module 'bilibili_api.favorite_list' has no attribute 'FavoriteListResource'`）。
+
+两处叠在一起，每个视频都返回 `{"ok": false, "error": "视频收藏夹需要 media_id"}`，日志里就是「自动收藏（auto）：0/3 条，失败 3」。
+
+改成**收藏动作挂在 Video 上**（收藏本来就属于视频，走 `API["operate"]["favorite"]`、`type=2`）：
+
+```python
+await v.set_favorite(add_media_ids=[int(fid)])
+```
+
+内部自己取 aid、自己拼 `add_media_ids`，不碰收藏夹对象。重复收藏（11202 / 「已经收藏过」）仍然当成功，跟原来一致。
+
+实测（真写了一次，`BV1nzx36iEph` → 收藏夹「哲学」）：`{'prompt': True, 'ga_data': None, 'toast_msg': '', 'success_num': 0}`，随后 `get_content()` 里确实多了这条，`media_count` 0→1；同一视频再收藏一次仍返回 `{"ok": true}`。
+
 ## 2.4.3 — 2026-10-31
 
 **修「开跑」必失败的那条：`Error: spawn EINVAL`。** 两条独立的原因叠在一起。
