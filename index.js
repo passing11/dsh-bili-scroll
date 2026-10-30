@@ -230,7 +230,7 @@ export const Config = !z ? undefined : z.object({
     /** 手动跑一轮最多挑几条（手动是「额外的一次」，不占每天额度） */
     manualMax: z.natural().default(3).extra('volatile', true),
     /** 两次手动之间至少隔几分钟（防手滑狂点、防烧 token） */
-    manualCooldownMin: z.natural().default(10).extra('volatile', true),
+    manualCooldownMin: z.natural().default(1).extra('volatile', true),
     /** 填了关键词时用哪种排序（pubdate=最新 / click=播放 / dm=弹幕 / totalrank=综合） */
     searchSort: z.string().default('pubdate').extra('volatile', true),
     /** 关键词搜索翻几页（一页约 20 条，默认 2 页 ≈ 40 条候选） */
@@ -397,7 +397,7 @@ function reportMeta() {
     dmMode: 'only', dmUid: 0,
     keywords: [], commentPerRound: 1, mentionName: '', pythonPath: 'python', dshBin: '', headlessProfile: 'headless', overlayMcp: true, workspace: '', reportLevel: 'full', replyToComments: false, replyPerRound: 1, favFolderId: 0,
     // ⭐ 2.3.0：手动轮 / 抓取量 / 排除词 / 评论长度 —— 少一项 normalize 就会把用户存的值丢掉
-    manualMax: 3, manualCooldownMin: 10, searchSort: 'pubdate', searchPages: 2, fetchPerRound: 8, excludeWords: [], commentLength: 'medium',
+    manualMax: 3, manualCooldownMin: 1, searchSort: 'pubdate', searchPages: 2, fetchPerRound: 8, excludeWords: [], commentLength: 'medium',
     // ⭐ 2.4.0：值班轮自己的模型（空 = 跟随主界面）
     dutyProvider: '', dutyModel: '', dutyReasoningEffort: '',
   }
@@ -1159,7 +1159,23 @@ function reportMeta() {
       '/usr/local/lib/node_modules/@deepseek-ai/dsh/lib/bin.js',
       '/usr/lib/node_modules/@deepseek-ai/dsh/lib/bin.js',
     ].filter(Boolean)) if (existsSync(g)) return g
-    // ④ 桌面版：在应用目录里有界搜一遍
+    // ④ 桌面版：先直接看宿主自己的 app.asar 里有没有（最稳，一次 existsSync 就够）
+    //    ⭐ 2026-10-30：Electron 的 asar 在 readdir 的 Dirent 里是"文件"（见 scanForDsh 的注释），
+    //    光靠递归搜索会漏掉它；而 `existsSync('…/app.asar/dsh/…/bin.js')` 在 Electron 里**返回 true** ✓
+    const selfRoots = []
+    try { if (process.resourcesPath) selfRoots.push(process.resourcesPath) } catch { /* 没有就算了 */ }
+    try { selfRoots.push(join(dirname(process.execPath), 'resources')) } catch { /* 没有就算了 */ }
+    for (const r of selfRoots) {
+      if (!r) continue
+      for (const rel of [
+        ['app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'],
+        ['app', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'],
+        ['dsh', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js'],
+      ]) {
+        try { const p = join(r, ...rel); if (existsSync(p)) return p } catch { /* 换下一个 */ }
+      }
+    }
+    // ⑤ 桌面版：在应用目录里有界搜一遍
     const roots = []
     if (process.resourcesPath) roots.push(process.resourcesPath)
     try { roots.push(join(dirname(process.execPath), 'resources')) } catch { /* 没有就算了 */ }
@@ -1173,15 +1189,24 @@ function reportMeta() {
     return ''
   }
   // 有界递归：深度 ≤ 7、最多翻 4000 个目录（桌面版 resources 里目录不小，别再往上加了）
+  // ⚠️⚠️ 2026-10-30（用户"开跑测试失败"，spawn EINVAL 的上游原因）：
+  //    以前用 `readdirSync(dir, { withFileTypes: true })` + `d.isDirectory()` 判目录，
+  //    而 **Electron 的 asar 归档在 Dirent 里被报成"文件"**（`isFile=true`），但 `statSync('…/app.asar')`
+  //    明确是目录、`readFileSync('…app.asar/dsh/…/bin.js')` 也读得到 ⇒ **整棵 app.asar 被跳过** ✗
+  //    桌面版 0.2.1-rc.5 的 dsh 恰好就在 `app.asar/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js` 里
+  //    ⇒ 扫 575 个目录返回空 ⇒ 退化到 PATH 里的 `dsh.cmd` ⇒ `spawn … EINVAL`（见下一条注释）。
+  //    ⇒ 改成"只取名字 + statSync 判目录"（stat 会穿透 asar），实测 203 个目录、15ms 就找到 ✓
   const scanForDsh = (dir, depth, budget) => {
     if (depth > 7 || budget.n > 4000) return ''
-    let ents = []
-    try { ents = readdirSync(dir, { withFileTypes: true }) } catch { return '' }
-    for (const d of ents) {
-      if (!d.isDirectory()) continue
+    let names = []
+    try { names = readdirSync(dir) } catch { return '' }
+    for (const name of names) {
       if (++budget.n > 4000) return ''
-      const p = join(dir, d.name)
-      if (d.name === 'dsh') {
+      const p = join(dir, name)
+      let isDir = false
+      try { isDir = statSync(p).isDirectory() } catch { continue }
+      if (!isDir) continue
+      if (name === 'dsh') {
         const bin = join(p, 'lib', 'bin.js')
         if (existsSync(bin)) return bin
       }
@@ -1204,14 +1229,27 @@ function reportMeta() {
       if (!dir) continue
       for (const n of names) {
         const p = join(dir, n)
-        try { if (existsSync(p)) return p } catch { /* 坏路径跳过 */ }
+        try { if (existsSync(p) && !shellScriptExt.test(n)) return p } catch { /* 坏路径跳过 */ }
+      }
+    }
+    return ''
+  }
+  // 只为了把话说清楚：PATH 里那个 dsh 是个脚本（.cmd/.bat/.ps1）⇒ 不能 shell:false 直启
+  const findShellScriptOnPath = () => {
+    if (process.platform !== 'win32') return ''
+    const dirs = String(process.env.PATH || '').split(';')
+    for (const d of dirs) {
+      const dir = d.replace(/^"|"$/g, '').trim()
+      if (!dir) continue
+      for (const n of ['dsh.cmd', 'dsh.bat', 'dsh.ps1']) {
+        try { const p = join(dir, n); if (existsSync(p)) return p } catch { /* 坏路径跳过 */ }
       }
     }
     return ''
   }
 
   const hasDshOnPath = () => {
-    const exts = process.platform === 'win32' ? ['', '.cmd', '.exe', '.bat', '.ps1'] : ['']
+    const exts = process.platform === 'win32' ? ['', '.exe', '.cmd', '.bat', '.ps1'] : ['']
     const dirs = String(process.env.PATH || '').split(process.platform === 'win32' ? ';' : ':')
     for (const d of dirs) {
       const dir = d.replace(/^"|"$/g, '').trim()
@@ -1222,6 +1260,15 @@ function reportMeta() {
     }
     return false
   }
+  /**
+   * ⭐⭐ 2026-10-30（用户"开跑测试失败"，duty.log 里就一句 `Error: spawn EINVAL`）：
+   *   PATH 里那个 `dsh` 其实是 **`dsh.cmd`**（`…\runtime\cli\bin\dsh.cmd`），而 Node ≥18.20 / ≥20.12
+   *   为了 CVE-2024-27980 **禁止 `shell:false` 直启 .cmd/.bat**（Windows 上必须经 cmd.exe 解释，
+   *   Node 干脆抛 EINVAL）⇒ 以前"最后一招"每次都必失败，而且只留一句看不懂的 EINVAL ✗
+   *   ⇒ 现在：`.exe` / 裸名照旧；`.cmd`/`.bat`/`.ps1` **不当成可执行文件**（真要用得经 shell，
+   *   那等于把提示词交给 cmd 解析 = 命令注入面，坚决不做 ✗），改为返回一个"看得懂的说明"。
+   */
+  const shellScriptExt = /^(\.cmd|\.bat|\.ps1)$/i
 
   let autoDshLogged = ''
   // ⭐ 缓存：设置页每 5 秒拉一次 /status，不能让"找不到时的递归搜索"每 5 秒跑一遍
@@ -1254,10 +1301,17 @@ function reportMeta() {
       return { missing: true, hint }
     }
     // ⭐ 安全加固：在 PATH 里解析成绝对路径再用（shell:false）—— 绝不 shell:true 拼字符串 ✗
-    const onPath = findOnPath(process.platform === 'win32' ? ['dsh.cmd', 'dsh.exe', 'dsh.bat', 'dsh'] : ['dsh'])
+    //    ⚠️ 2026-10-30：只认 `.exe` / 裸名；`.cmd` 见下面 findShellScriptOnPath 的说明
+    const onPath = findOnPath(process.platform === 'win32' ? ['dsh.exe', 'dsh'] : ['dsh'])
     if (onPath) {
       log('⚠️ 没在常见位置找到 dsh，改用 PATH 里那份（绝对路径、不经 shell）：' + onPath)
       return { command: onPath, args: [], shell: false, fallback: true, hint }
+    }
+    const script = findShellScriptOnPath()
+    if (script) {
+      const why = 'PATH 里只有脚本 ' + script + '（.cmd/.bat 不经 shell 直启会被 Node 拒绝：spawn EINVAL）'
+      log('⚠️ 找不到 dsh：' + why + ' ⇒ ' + hint)
+      return { missing: true, hint: why + '。' + hint }
     }
     log('⚠️ 找不到 dsh（常见位置、应用目录、PATH 里都没有）⇒ ' + hint)
     return { missing: true, hint }
@@ -1791,6 +1845,9 @@ function reportMeta() {
     //      它写不了家目录里的 out/ 报告、整轮卡在"我是被沙箱关着的"上面打转 ✗；
     //      现在改成"设定由插件读进来、内联进提示词" ✓，cwd 回到插件家 ✓）
       // ⭐ 2.3.0：手动轮是「额外的一次」，但两次之间要冷却（防手滑狂点 / 防烧 token）
+      // ⚠️ 2026-10-30（用户"开跑测试失败"）：冷却计时以前在 **spawn 之前** 就写进去了 ⇒
+      //    那一次根本没跑起来（spawn EINVAL），却照样吃掉冷却，用户再点就被"再等 10 分钟"挡住 ✗
+      //    ⇒ 现在只在 **子进程真的起来之后**（'spawn' 事件）才记账 ✓
       if (why === 'manual') {
         const st0 = readJson(dutyStateFile, {})
         const last = Number(st0.lastManualAt || 0)
@@ -1800,7 +1857,6 @@ function reportMeta() {
           log(`手动轮刚跑过（${Math.round((Date.now() - last) / 60_000)} 分钟前）⇒ 再等 ${wait} 分钟`)
           return { ok: false, started: false, error: `手动轮刚跑过，再等 ${wait} 分钟（防手滑狂点）` }
         }
-        bumpState({ lastManualAt: Date.now() })
       }
     const cwd = stateDir
     log(`刷B站开跑（${why}）：${dsh.command} ${args.slice(0, 3).join(' ')} …  cwd=${cwd}`)
@@ -1870,6 +1926,8 @@ function reportMeta() {
     child.on('close', () => { if (dutyChild === child) dutyChild = null })
     dutyChild = child
     dutyStartedAt = Date.now()
+    // ⭐ 2026-10-30：子进程**真的起来了**才记冷却（spawn 失败不该吃额度）
+    child.on('spawn', () => { if (why === 'manual') bumpState({ lastManualAt: Date.now() }) })
     child.on('error', (e) => { releaseRunLock(); log(`刷B站起不来：${e?.message ?? e}`) })
     // ⭐ 起不来/被杀掉也要把锁放开，否则之后每一轮都会被判成'上一轮还没结束' ✗
     child.on('close', () => { if (dutyChild === child) dutyChild = null })

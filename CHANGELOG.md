@@ -1,3 +1,25 @@
+## 2.4.3 — 2026-10-31
+
+**修「开跑」必失败的那条：`Error: spawn EINVAL`。** 两条独立的原因叠在一起。
+
+1. **找不到 dsh 了（桌面版 0.2.1-rc.5 / Electron 44.7.0）**：`scanForDsh` 以前用
+   `readdirSync(dir, { withFileTypes: true })` + `d.isDirectory()` 判目录，而 Electron 的 asar 归档
+   **在 Dirent 里被报成文件**（`isFile=true`），可 `statSync('…/app.asar')` 明确是目录、
+   `readFileSync('…app.asar/dsh/…/bin.js')` 也读得到 ⇒ **整棵 `app.asar` 被跳过**，扫 575 个目录返回空。
+   而 dsh 恰好就在 `app.asar/dsh/node_modules/@deepseek-ai/dsh/lib/bin.js` 里。
+   现在改成「只取名字 + `statSync` 判目录」（stat 会穿透 asar），并加一条最稳的直查候选
+   `join(process.resourcesPath, 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js')`。
+   实测：直查 31ms 命中、stat 版扫描 13ms 命中，旧的 Dirent 版仍然是空。
+2. **退到 PATH 之后必然 EINVAL**：PATH 里那个 `dsh` 是 `dsh.cmd`，而 Node ≥18.20 / ≥20.12 为 CVE-2024-27980
+   **禁止 `shell:false` 直启 `.cmd` / `.bat`**。以前把它当可执行文件返回，spawn 直接抛 EINVAL，
+   日志里只剩一句看不懂的英文。现在 `.cmd`/`.bat`/`.ps1` 不再当可执行文件
+   （要经 shell 就等于把提示词交给 cmd 解析 = 命令注入面，坚决不做），改为返回一条**看得懂的说明**：
+   「PATH 里只有脚本 xxx（.cmd/.bat 不经 shell 直启会被 Node 拒绝：spawn EINVAL）」。
+3. **冷却不再被失败的尝试吃掉**：`lastManualAt` 以前在 spawn **之前** 就写进 state ⇒ 那一轮根本没起来也照样冷却。
+   现在挪到子进程的 `spawn` 事件之后。
+
+另外把手动轮的冷却默认值 **10 分钟 → 1 分钟**（两次之间隔太久）。
+
 ## 2.4.2 — 2026-10-30
 
 **这一版把本地攒下的两笔改动合回上游主线。**
