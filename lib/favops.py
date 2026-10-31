@@ -49,13 +49,19 @@ async def folders():
 
 async def add(bvid, fid):
     from bilibili_api import video as ba_video
-    # ⭐ 收藏是 **Video 上的动作**（API operate/favorite，type=2 视频），不是收藏夹上的动作。
-    #    老写法有两处跟 bilibili-api-python 17.4.x 对不上，导致「自动收藏 0/3」：
-    #      ① favorite_list.FavoriteList(aid, credential=cred)
-    #         第一个位置参数是 type_（收藏夹类型），不是 aid ⇒ aid 被当成类型、
-    #         media_id 仍是 None ⇒ 抛「视频收藏夹需要 media_id」；
-    #      ② favorite_list.FavoriteListResource —— 这个类在 17.4.x 里根本不存在。
-    #    正确写法就是下面这一行（内部自己取 aid、自己拼 add_media_ids）。
+    # ⭐⭐ 修（连续四天「自动收藏 0/4」的真正原因 —— 两个错叠在一起，本 fork 与上游各自独立查出）：
+    #    ① `FavoriteList(aid, credential=…)`：它的第一个位置参数是 `type_`（收藏夹类型），不是
+    #       media_id ⇒ **视频 id 被当成了收藏夹类型**、media_id 留空 ⇒ 每轮必抛
+    #       「视频收藏夹需要 media_id」；
+    #    ② 就算修好①，`favorite_list.FavoriteListResource` 在现在这个版本的 bilibili_api 里
+    #       **已经不存在了**（`module has no attribute 'FavoriteListResource'`）。
+    #    ⇒ 改用现成的 `Video.set_favorite(add_media_ids=[fid])`：库自己取 aid、自己拼 add/del。
+    #    收藏是 **Video 上的动作**（API operate/favorite，type=2 视频），不是收藏夹上的动作。
+    #    ⚠️ 别再回到 FavoriteList + FavoriteListResource 那套 —— 那是老版本的 API。
+    #    （附：更早还有个坑是函数内没 import favorite_list 导致 NameError，见 issue #76；
+    #      现在不走 favorite_list 了，那个坑自然不存在。）
+    #    ⚠️ 上游那版在 set_favorite 之前还有一行 `await v.get_info()`；本 fork 实测去掉也能跑
+    #       ⇒ 不保留（每轮少一次视频信息请求）。
     cred, _ = load()
     v = ba_video.Video(bvid=bvid, credential=cred)
     try:
