@@ -1878,18 +1878,82 @@ function reportMeta() {
    *   写进报告顶部；认不出来就走原来的兜底文案（行为跟以前一样）。
    * ⚠️ 只在"报告本来该有却没有"时补（`reportLevel: off` 不补），不覆盖已有报告。
    */
+  /**
+   * 从报告正文里摘掉「## 投递」这一节（只摘标题 + 紧跟着的 `- ` 条目），返回新正文。
+   * ⚠️ 为什么不能像以前那样"从 `## 投递` 一刀切到文件末尾"（2.4.7 修的就是这个）：
+   *   模型写日报用的是 `duty_report_append` —— 它是**往文件末尾追加**的。
+   *   而报告里几乎总是先有一节 `## 投递`（占位报告自带一节、每轮收尾又追加一节），
+   *   于是"切到末尾"会把模型这一轮刚写进去的 `### BV…` 全部切掉 ⇒
+   *   报告恒为 0 条、`seen.md` 却记着"挑了十几条"，使用者点开日报只看到一段日志尾巴 ✗。
+   *   实测：2026-10-28 / 10-29 / 10-30 / 11-01 / 11-02 / 11-03 六份报告的 `###` 全是 0。
+   */
+  const stripDeliveryBlock = (text) => {
+    let cur = String(text || '')
+    for (let guard = 0; guard < 8; guard += 1) {
+      const at = cur.lastIndexOf('## 投递')
+      if (at < 0) break
+      const before = cur.slice(0, at)
+      const lines = cur.slice(at).split('\n')
+      // 第 0 行是标题；紧跟着的 `- ` 条目算这一节，遇到第一个"非空、非列表项"的行就停
+      let i = 1
+      while (i < lines.length) {
+        const t = lines[i].trim()
+        if (!t || /^[-*]\s/.test(t)) { i += 1; continue }
+        break
+      }
+      const rest = lines.slice(i).join('\n')
+      cur = before.replace(/\s*$/, '') + (rest.trim() ? '\n\n' + rest.replace(/^\s*\n/, '') : '')
+    }
+    return cur
+  }
+
+  /**
+   * ⭐ 2.4.7：把"占位报告"的头（`# 刷B站 · … —— 这一轮没跑起来/没写出报告` + 日志围栏）摘掉。
+   *
+   * 起因：占位报告只在"报告不存在"时补（`stubReportIfMissing` 里 `if (existsSync(f)) return`），
+   *   于是失败轮留下的占位头会**一直挂在那天的报告顶上**；后面某一轮真的跑成了、模型也把
+   *   `### BV…` 追加进去了，使用者点开看到的仍是"这一轮没写出报告" ✗。
+   * 做法：只认**文件开头**那一段占位头（标题行 + 紧随的第一个 ``` 围栏），摘掉它、留下后面的正文。
+   *   认不出来（正常报告 / 模型自己写的日报）⇒ 原样返回，绝不动。
+   * ⚠️ 必须定义在 `writeRoundNotesToReport` **之前**：那里是同步调用，`const` 不提升，
+   *   写在后面会在 TDZ 里抛 ReferenceError —— 而那层 catch 是空的，会静默把整段收尾吞掉
+   *   （实测 2026-11-03：正文保住了，但占位头没摘、`## 投递` 也没写进报告）。
+   */
+  const stripPlaceholderHead = (text) => {
+    const cur = String(text || '')
+    const lines = cur.split('\n')
+    if (!/^#\s*刷B站\s*·\s*\d{4}-\d{2}-\d{2}\s*——\s*这一轮(没跑起来|没写出报告)/.test((lines[0] || '').trim())) return cur
+    // 找紧随其后的第一个围栏块（占位报告的日志尾巴），连它一起摘掉
+    const open = lines.findIndex((l, i) => i > 0 && l.trim() === '```')
+    if (open < 0) return cur
+    let close = open + 1
+    while (close < lines.length && lines[close].trim() !== '```') close += 1
+    if (close >= lines.length) return cur
+    let i = close + 1
+    while (i < lines.length && !lines[i].trim()) i += 1
+    const rest = lines.slice(i).join('\n')
+    return rest.trim() ? rest : cur
+  }
+
     const writeRoundNotesToReport = () => {
       try {
-        if (!roundNotes.length) return
         if (String(cfg.reportLevel || 'full') === 'off') return
         const f = join(outDir, `${dayKey()}.md`)
-        const block = '## 投递\n\n' + roundNotes.map((n) => '- ' + n).join('\n') + '\n'
-        if (!existsSync(f)) { writeFileSync(f, `# 刷B站 · ${dayKey()}\n\n` + block, 'utf8'); return }
+        const block = roundNotes.length ? '## 投递\n\n' + roundNotes.map((n) => '- ' + n).join('\n') + '\n' : ''
+        if (!existsSync(f)) {
+          if (!block) return
+          writeFileSync(f, `# 刷B站 · ${dayKey()}\n\n` + block, 'utf8')
+          return
+        }
         let cur = readFileSync(f, 'utf8')
-        const at = cur.indexOf('## 投递')
-        if (at >= 0) cur = cur.slice(0, at).replace(/\s*$/, '') + '\n'
-        writeFileSync(f, cur.replace(/\s*$/, '') + '\n' + block, 'utf8')
-      } catch { /* 宁可没这段，也不能让这一轮挂掉 */ }
+        cur = stripDeliveryBlock(cur)   // ⭐ 只摘那一节，模型写的 `### BV…` 原样留着
+        // ⭐ 2.4.7：把失败轮留下的占位头摘掉 —— **这一步不依赖 roundNotes**：
+        //    `dmMode: off`（不投递）时 roundNotes 是空的，以前那种"没 note 就直接 return"
+        //    会让占位头永远挂在当天报告顶上（实测 2026-11-03）。
+        cur = stripPlaceholderHead(cur)
+        const out = cur.replace(/\s*$/, '')
+        writeFileSync(f, (out ? out + '\n\n' : '') + block, 'utf8')
+      } catch (e) { log(`把这一轮的投递写进报告时出错（不影响这一轮）：${e?.message ?? e}`) }
     }
 
   const stubReportIfMissing = (code) => {
