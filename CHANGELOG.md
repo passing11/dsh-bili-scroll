@@ -1,3 +1,27 @@
+## 2.4.6 — 2026-11-03
+
+**修「不会自动刷」：一轮死在第一个请求前（`UNKNOWN_MODEL` / `NO_ADAPTER`）照样把谷时窗口烧掉，当天不再重试。**
+
+用户看到的现象是"插件不会自动刷了"。翻 `duty.log` 才发现：自动轮一直在触发，只是每轮 7~18 秒就 `code=1` 退出，报的是
+
+```
+dsh: UNKNOWN_MODEL: pi-ai provider "workbuddy-global" has no configured model "deepseek-v4.1-flash"
+```
+
+两个错叠在一起：
+
+1. **模型没了，但配置还钉着它**：2026-11-02 04:15 起 WorkBuddy **国际区**的实时 roster 不再列 `deepseek-v4.1-flash`（只剩 `deepseek-v4.1-flash-sg`；国内区还有前者）。`providerUsable()` 在 2.4.5 里只校验 **provider** 有没有适配器，不校验**模型**在不在目录里 ⇒ 钉着一个不存在的型号照样往下走 ⇒ 发第一个请求前就被宿主拒掉，报告一个字都写不出来。
+2. **窗口记账在 spawn 之前**：`tick()` 先把 `windows['YYYY-MM-DD:noon|night'] = true` 写进 state，再 `runDuty()`。于是一轮秒死也算"今天这档跑过了" ⇒ 失败后到窗口结束都不再重试，使用者只看到"不会自动刷"。夜窗跨午夜（18:00–09:00，0 点 `dayKey` 翻页）还会被记两次。
+
+这一版：
+
+- **窗口记账挪到子进程真的起来之后**（`child.on('spawn')`，与 2.4.3 修手动轮冷却同一套写法）。spawn 失败 / 秒死都不再消耗窗口。
+- **配置错会退回窗口**：收尾时如果 `code !== 0` 且这一轮自己吐出的最后 4KB 里出现 `UNKNOWN_MODEL` / `NO_ADAPTER`，判定为"死在第一个请求前的配置错"，把该窗口标记删掉、轮次减一 ⇒ 60 秒后定时器会再试一次（这次会自动换到能用的模型）。
+- **坏模型记账（`state.badModels`）**：同一时刻把出事的 `provider/model` 记下来（带原始错误行），`chosenModel()` 之后 **7 天内跳过它**、改用当前会话的模型；两个都坏就兜底 `deepseek-account/deepseek-flash`。7 天后自动作废 —— 上游把型号放回来时会自己恢复，不会把用户永久钉死。`status.model.ignoredBad` 会带上原因，设置页把这句话原样显示出来。
+- **模型从错误行里精确抠**：正则 `provider "X" has no configured model "Y"`，抠不出来才退回"这一轮开跑时选定的那对"。不在收尾时重算 —— 那时 `badModels` 已经变了，重算会标错对象。
+
+**升级**：本 fork 是 `link:` 装的，改完重启 DSH 即可（桌面版不热重载）。
+
 ## 2.4.5 — 2026-10-31
 
 **合入上游 `v2.4.0`（`398e472`）的全部 8 条改动，并与本 fork 自己那套「值班轮用哪个模型」合并成一条路。**

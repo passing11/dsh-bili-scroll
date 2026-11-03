@@ -1694,13 +1694,48 @@ function reportMeta() {
     } catch { /* 老版本没有这个服务 —— 不写就退回原行为 */ }
     return null
   }
+  /* ⭐⭐ 2.4.6：**已经被证伪的模型**（`UNKNOWN_MODEL` / `NO_ADAPTER` 实测死在第一个请求前）
+   *    以前 provider 认得、模型却不在了（上游 roster 撤掉某个型号，比如 2026-11-02 起
+   *    workbuddy-global 不再列 `deepseek-v4.1-flash`，只剩 `-sg`）⇒ 照样当成合法 pin ⇒
+   *    整轮 7 秒就死、连报告都写不出来，用户只看到"不会自动刷" ✗
+   *    ⇒ 收尾时把坏模型记进 state.badModels，这里跳过它（7 天后自动作废，别把用户永久钉死）
+   */
+  const BAD_MODEL_TTL = 7 * 24 * 60 * 60 * 1000
+  const badModelOf = (m) => {
+    if (!m?.provider || !m?.model) return null
+    try {
+      const st = readJson(dutyStateFile, {})
+      const hit = st.badModels?.[`${m.provider}/${m.model}`]
+      if (!hit) return null
+      if (Date.now() - Number(hit.at || 0) > BAD_MODEL_TTL) return null
+      return hit
+    } catch { return null }
+  }
+  const markBadModel = (m, error) => {
+    if (!m?.provider || !m?.model) return
+    try {
+      const st = readJson(dutyStateFile, {})
+      const bad = { ...(st.badModels || {}) }
+      bad[`${m.provider}/${m.model}`] = { at: Date.now(), error: String(error || '').slice(0, 300) }
+      // 只留最近 20 条，别让 state 无限长
+      const keys = Object.keys(bad)
+      if (keys.length > 20) {
+        keys.sort((a, b) => Number(bad[a]?.at || 0) - Number(bad[b]?.at || 0))
+        for (const k of keys.slice(20)) delete bad[k]
+      }
+      bumpState({ badModels: bad })
+      log(`记下这个模型跑不了（${m.provider}/${m.model}）：${String(error || '').slice(0, 120)} ⇒ 7 天内不再用它`)
+    } catch { /* 记不住也不影响这一轮的结论 */ }
+  }
   const chosenModel = () => {
     const pin = pinnedModel()
-    if (pin && providerUsable(pin.provider)) return { ...pin, source: 'plugin' }
+    const pinBad = badModelOf(pin)
+    if (pin && providerUsable(pin.provider) && !pinBad) return { ...pin, source: 'plugin' }
     const ses = sessionModel()
-    // 指定了但 headless 用不了 ⇒ 带上 `ignored`（调用方据此告警），实际用会话那个
-    if (ses && providerUsable(ses.provider)) {
-      return pin ? { ...ses, source: 'session', ignored: pin } : ses
+    const sesBad = badModelOf(ses)
+    // 指定了但 headless 用不了 / 已知跑不了 ⇒ 带上 `ignored`（调用方据此告警），实际用会话那个
+    if (ses && providerUsable(ses.provider) && !sesBad) {
+      return pin ? { ...ses, source: 'session', ignored: pin, ...(pinBad ? { ignoredBad: pinBad } : {}) } : ses
     }
     // 🔴 当前会话用的也是刷B站用不了的（桌面版切到 Antigravity / Claude 就这情况）⇒
     //    再兜底到 DeepSeek 账号路由：宁可换模型，也别让这一轮在第一个请求前就死掉
@@ -1708,7 +1743,9 @@ function reportMeta() {
       ...FALLBACK_MODEL,
       source: 'fallback',
       ...(pin ? { ignored: pin } : {}),
+      ...(pinBad ? { ignoredBad: pinBad } : {}),
       ...(ses ? { sessionIgnored: { provider: ses.provider, model: ses.model } } : {}),
+      ...(sesBad ? { sessionIgnoredBad: sesBad } : {}),
     }
   }
 
@@ -1740,6 +1777,11 @@ function reportMeta() {
     //    ⚠️ YAML 里这几个值一律加引号（用上面的 yq）—— 用户手填的 provider/model 带空格或冒号时不加引号会写坏整份 overlay
     try {
       const sel = chosenModel()
+      // ⭐ 2.4.6：钉住的模型**实测跑不了**（上一轮 UNKNOWN_MODEL/NO_ADAPTER 死在第一个请求前）⇒ 说清楚为什么跳过它
+      if (sel?.ignoredBad) {
+        log(`⚠️ 设置里钉的 ${sel.ignored?.provider ?? '?'} / ${sel.ignored?.model ?? '?'} 上一轮跑不起来（${String(sel.ignoredBad.error || '').slice(0, 160)}）`
+          + `⇒ 7 天内先跳过它，这一轮用 ${sel.provider} / ${sel.model}。换一个模型或等上游恢复后会自动再用回来`)
+      }
       // ⭐ 指定了/当前会话是这一轮 profile 里没有的 provider ⇒ 别带它（带了必 NO_ADAPTER），但要留一句明白话
       if (sel?.source === 'fallback') {
         log('⚠️ ' + (sel.sessionIgnored ? `当前会话的模型 ${sel.sessionIgnored.provider} / ${sel.sessionIgnored.model}` : '当前模型')
@@ -2031,7 +2073,11 @@ function reportMeta() {
     t.unref?.()
     return true
   }
-  const runDuty = (why = 'window') => {
+  // ⭐ 2.4.6：`windowKey` = 这一轮要消耗的谷时窗口标记（`YYYY-MM-DD:noon|night`）。
+  //    以前 `tick` 在 spawn **之前**就把窗口标记成 true ⇒ 一轮秒死（UNKNOWN_MODEL）也算"今天这档跑过了"，
+  //    于是失败后到窗口结束都不再重试，使用者只看到"不会自动刷" ✗
+  //    ⇒ 现在改成：**子进程真的起来**（'spawn'）才记账；死在第一个请求前的配置错还会把窗口**退回** ✓
+  const runDuty = (why = 'window', windowKey = '') => {
    try {
       if (dutyChild) {
         const alive = dutyChild.exitCode === null && !dutyChild.killed
@@ -2075,6 +2121,9 @@ function reportMeta() {
           return { ok: false, started: false, error: `手动轮刚跑过，再等 ${wait} 分钟（防手滑狂点）` }
         }
       }
+    // ⭐ 2.4.6：把**这一轮真正要用的模型**记下来 —— 收尾判定"配置错"时要标的就是它
+    //    （不能在收尾时重算：那时 badModels 已经变了，会标错对象）
+    const usedModel = (() => { try { return chosenModel() } catch { return null } })()
     // ⭐ 本地补丁：值班轮 cwd = 设置里的 workspace ⇒ 会话归到该工作区，而不是侧栏「未分组」（见 dutyCwd）
     const cwd = dutyCwd()
     log(`刷B站开跑（${why}）：${dsh.command} ${args.slice(0, 3).join(' ')} …  cwd=${cwd}`)
@@ -2104,8 +2153,13 @@ function reportMeta() {
         try { return new TextDecoder('gbk').decode(b) } catch { return u }
       } catch { return String(buf) }
     }
+    // ⭐ 2.4.6：留一小段"这一轮自己吐出来的话" —— 收尾时用它判断"是不是第一个请求前就死了"
+    //    （`UNKNOWN_MODEL` / `NO_ADAPTER` 这类配置错，日志里才有，state 里看不出来）
+    let recentOut = ''
     const pick = (buf) => {
-      try { appendFileSync(logFile, toText(buf), 'utf8') } catch { /* 写不进去就丢，绝不能抛 */ }
+      const text = toText(buf)
+      try { recentOut = (recentOut + text).slice(-4000) } catch { /* 忽略 */ }
+      try { appendFileSync(logFile, text, 'utf8') } catch { /* 写不进去就丢，绝不能抛 */ }
     }
     child.stdout?.on('data', pick)
     child.stderr?.on('data', pick)
@@ -2119,6 +2173,33 @@ function reportMeta() {
       const startedAt = dutyStartedAt
       if (dutyChild === child) dutyClear()
       log(`刷B站结束（${why}，code=${code}）`)
+      /* ⭐⭐ 2.4.6：**死在第一个请求前的配置错**（模型/provider 不在目录里）要单独处理 ——
+       *    `UNKNOWN_MODEL: pi-ai provider "workbuddy-global" has no configured model "deepseek-v4.1-flash"`
+       *    `NO_ADAPTER: no adapter registered for provider "workbuddy-global"`
+       *    这类错在 7~18 秒内就退，报告一个字都没写 ⇒ 使用者看到的就是"插件不会自动刷"。
+       *    以前窗口标记在 spawn 前就记了 ⇒ 这一档当天彻底不再重试 ✗
+       *    ⇒ ① 把坏模型记进 state.badModels（`chosenModel` 下次跳过它）
+       *      ② 谷时窗口**退回**（`tick` 60 秒后会再试，这次会自动换到能用的模型）✓
+       */
+      try {
+        if (code !== 0 && /UNKNOWN_MODEL|NO_ADAPTER/.test(recentOut || '')) {
+          // ⚠️ 优先从错误行里**精确抠出** provider/model（`provider "X" has no configured model "Y"`）；
+          //    抠不出来才退回"这一轮开跑时选定的那对"。不要在这里重算 chosenModel ——
+          //    那时 badModels 已经变了，会标错对象。
+          const line = (String(recentOut).match(/UNKNOWN_MODEL[^\n]*|NO_ADAPTER[^\n]*/) || [''])[0].trim()
+          const m = line.match(/provider\s+"([^"]+)"\s+has no configured model\s+"([^"]+)"/)
+          const bad = m ? { provider: m[1], model: m[2] } : usedModel
+          markBadModel(bad, line)
+          if (windowKey) {
+            const st = readJson(dutyStateFile, {})
+            const windows = { ...(st.windows || {}) }
+            delete windows[windowKey]
+            // ⭐ 重试要有节流：不加这条的话，若连兜底模型都跑不了，就会每 60 秒起一轮、无限循环
+            bumpState({ windows, count: Math.max(0, roundsToday() - 1), configDeadUntil: Date.now() + 10 * 60_000 })
+            log(`这一轮死在配置错（${line.slice(0, 120)}）⇒ 窗口「${windowKey}」退回，10 分钟后换模型重试`)
+          }
+        }
+      } catch (e) { log(`判断这一轮是不是配置错时出错（不影响收尾）：${e?.message ?? e}`) }
       // ⭐ 2026-10-25：这一轮刚生成的会话，稍等它落盘后归档 —— 别让它占着侧栏「未分组」
       try {
         const t = setTimeout(() => { archiveDutyBucket(startedAt - 5000) }, 1200)
@@ -2155,7 +2236,19 @@ function reportMeta() {
     })
     child.on('close', () => { if (dutyChild === child) dutyChild = null })
     // ⭐ 2026-10-30（本 fork）：子进程**真的起来了**才记冷却（spawn 失败不该吃额度）
-    child.on('spawn', () => { if (why === 'manual') bumpState({ lastManualAt: Date.now() }) })
+    // ⭐ 2.4.6：谷时窗口同理 —— 起来了才算"今天这档跑过"（见 runDuty 上方注释）
+    child.on('spawn', () => {
+      if (why === 'manual') bumpState({ lastManualAt: Date.now() })
+      if (windowKey) {
+        const st = readJson(dutyStateFile, {})
+        bumpState({
+          windows: { ...(st.windows || {}), [windowKey]: true },
+          count: roundsToday() + 1,
+          lastRunAt: new Date().toISOString(),
+          lastWhy: why,
+        })
+      }
+    })
     child.on('error', (e) => {
       releaseRunLock()
       if (dutyChild === child) dutyClear()
@@ -2181,6 +2274,9 @@ function reportMeta() {
       const now = new Date()
       const st = readJson(dutyStateFile, {})
       const today = dayKey(now)
+      // ⭐ 2.4.6：上一轮死在配置错（模型/provider 不在目录里）⇒ 10 分钟内别再起 ——
+      //    没有这条节流的话，连兜底模型都跑不了时会每 60 秒起一轮、无限循环烧 token
+      if (Number(st.configDeadUntil || 0) > Date.now()) return
       // ⭐ 闸门看的是「今天已经**挑到几条**」（从今天的报告里数出来），不是「跑了几轮」
       if (autoPickedToday(now) >= Number(cfg.perDay || 0)) return
       // ⭐ 「不写日报」那档没有报告可数 ⇒ 数不出条数就保守一点：一天只跑一轮
@@ -2190,8 +2286,9 @@ function reportMeta() {
         if (!inWindow(now, WINDOWS[k])) continue
         const key = `${today}:${k}`
         if (st.windows?.[key]) continue
-        bumpState({ windows: { ...(st.windows || {}), [key]: true }, count: roundsToday(now) + 1, lastRunAt: now.toISOString(), lastWhy: k })
-        runDuty(`window:${k}`)
+        // ⭐ 2.4.6：窗口标记**不在这里记** —— 交给 runDuty 在子进程 'spawn' 之后记。
+        //    以前这里先记再跑，一轮秒死（UNKNOWN_MODEL）也算"今天这档跑过了" ⇒ 当天不再重试 ✗
+        runDuty(`window:${k}`, key)
         return
       }
     } catch (e) {

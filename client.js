@@ -711,6 +711,11 @@ function WatchTab() {
           h('div', { 'data-bd-note': '' },
             '⚠️ 这里只列「这一轮那个 profile 里装了的」provider。2.1.0 起值班轮默认跑最小权限的 `bili-duty` profile，'
             + '里面只有 DeepSeek 两条路由；Antigravity 只在老的 `headless` profile 里，所以默认不出现。'),
+          st.model && st.model.ignoredBad ? h('div', { 'data-bd-msg': '', 'data-warn': '' },
+            '你指定的 ' + (st.model.ignored ? st.model.ignored.provider + ' / ' + st.model.ignored.model : '模型')
+            + ' 上一轮实测跑不起来（' + String((st.model.ignoredBad && st.model.ignoredBad.error) || '').slice(0, 120) + '）'
+            + '⇒ 7 天内先跳过它，这一轮用 ' + st.model.provider + ' / ' + st.model.model
+            + '。换个模型，或等上游把这个型号放回来，到时会自动再用它。') : null,
           st.model && st.model.ignored ? h('div', { 'data-bd-msg': '', 'data-warn': '' },
             '你指定的 ' + st.model.ignored.provider + ' / ' + st.model.ignored.model
             + ' 刷B站这一轮用不了（headless 里没有这个适配器）⇒ 已自动改回'
@@ -1060,6 +1065,14 @@ function WatchTab() {
                       : '这一轮跟着主界面走 —— 主界面换成哪个，它就用哪个。'))),
               (models && models.ok && !providers.length)
                 ? h('div', { 'data-bd-note': '' }, '这台机器上还没装出任何可用的 provider（先登录 / 装 provider 插件）。')
+                : null,
+              // ⭐ 2.4.6：钉住的模型上一轮实测跑不了（UNKNOWN_MODEL / NO_ADAPTER）⇒ 必须在这里说，
+              //    否则用户会以为"设置没生效"、或者干脆以为插件坏了
+              (st && st.model && st.model.ignoredBad)
+                ? h('div', { 'data-bd-msg': '', 'data-warn': '' },
+                  '⚠️ 你钉的这个模型上一轮跑不起来（' + String((st.model.ignoredBad && st.model.ignoredBad.error) || '').slice(0, 140) + '）'
+                  + '⇒ 7 天内先跳过它，这一轮用 ' + st.model.provider + ' / ' + st.model.model
+                  + '。请在上面换一个还在列表里的模型（上游撤掉的型号再选也是白选）。')
                 : null)
           })()),
 
