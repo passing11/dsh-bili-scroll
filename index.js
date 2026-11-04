@@ -1707,16 +1707,22 @@ function reportMeta() {
       const st = readJson(dutyStateFile, {})
       const hit = st.badModels?.[`${m.provider}/${m.model}`]
       if (!hit) return null
-      if (Date.now() - Number(hit.at || 0) > BAD_MODEL_TTL) return null
+      // ⭐ 2.4.8：每条可以带自己的 ttl —— 凭证被拒是**账号层面**的事，会恢复，不该封 7 天
+      const ttl = Number(hit.ttl) > 0 ? Number(hit.ttl) : BAD_MODEL_TTL
+      if (Date.now() - Number(hit.at || 0) > ttl) return null
       return hit
     } catch { return null }
   }
-  const markBadModel = (m, error) => {
+  const markBadModel = (m, error, ttl = 0) => {
     if (!m?.provider || !m?.model) return
     try {
       const st = readJson(dutyStateFile, {})
       const bad = { ...(st.badModels || {}) }
-      bad[`${m.provider}/${m.model}`] = { at: Date.now(), error: String(error || '').slice(0, 300) }
+      bad[`${m.provider}/${m.model}`] = {
+        at: Date.now(),
+        error: String(error || '').slice(0, 300),
+        ...(Number(ttl) > 0 ? { ttl: Number(ttl) } : {}),
+      }
       // 只留最近 20 条，别让 state 无限长
       const keys = Object.keys(bad)
       if (keys.length > 20) {
@@ -1724,7 +1730,9 @@ function reportMeta() {
         for (const k of keys.slice(20)) delete bad[k]
       }
       bumpState({ badModels: bad })
-      log(`记下这个模型跑不了（${m.provider}/${m.model}）：${String(error || '').slice(0, 120)} ⇒ 7 天内不再用它`)
+      // 2.4.8：封禁期不再写死"7 天" —— 凭证类是 30 分钟，说清楚免得使用者以为要等一周
+      const span = Number(ttl) > 0 ? `${Math.round(Number(ttl) / 60_000)} 分钟内` : '7 天内'
+      log(`记下这个模型跑不了（${m.provider}/${m.model}）：${String(error || '').slice(0, 120)} ⇒ ${span}不再用它`)
     } catch { /* 记不住也不影响这一轮的结论 */ }
   }
   const chosenModel = () => {
@@ -2246,21 +2254,28 @@ function reportMeta() {
        *      ② 谷时窗口**退回**（`tick` 60 秒后会再试，这次会自动换到能用的模型）✓
        */
       try {
-        if (code !== 0 && /UNKNOWN_MODEL|NO_ADAPTER/.test(recentOut || '')) {
+        // ⭐ 2.4.8：**凭证被上游拒**（`AUTH: 401 … code 1001` / `credential-rejected`）也算这一类 ——
+        //    它和"模型没了"一样死在第一个请求前，症状同样是几分钟内静默失败。
+        //    以前只认 UNKNOWN_MODEL / NO_ADAPTER ⇒ trae 两个账号 2026-11-04 起全 401 时，
+        //    当天窗口被白烧掉、还不换模型，第二天重来一次 ✗
+        if (code !== 0 && /UNKNOWN_MODEL|NO_ADAPTER|AUTH:\s*401|credential-rejected|not able to authenticate/i.test(recentOut || '')) {
           // ⚠️ 优先从错误行里**精确抠出** provider/model（`provider "X" has no configured model "Y"`）；
           //    抠不出来才退回"这一轮开跑时选定的那对"。不要在这里重算 chosenModel ——
           //    那时 badModels 已经变了，会标错对象。
-          const line = (String(recentOut).match(/UNKNOWN_MODEL[^\n]*|NO_ADAPTER[^\n]*/) || [''])[0].trim()
+          const line = (String(recentOut).match(/UNKNOWN_MODEL[^\n]*|NO_ADAPTER[^\n]*|AUTH:[^\n]*/i) || [''])[0].trim()
           const m = line.match(/provider\s+"([^"]+)"\s+has no configured model\s+"([^"]+)"/)
           const bad = m ? { provider: m[1], model: m[2] } : usedModel
-          markBadModel(bad, line)
+          // 凭证被拒 ≠ 模型没了：账号会恢复（重新登录 / 风控过期），所以只封 30 分钟，
+          // 别学 UNKNOWN_MODEL 那样一封 7 天 —— 否则用户换回账号也得等一周
+          const isAuth = !m && /AUTH|401|credential-rejected|not able to authenticate/i.test(line)
+          markBadModel(bad, line, isAuth ? 30 * 60_000 : 0)
           if (windowKey) {
             const st = readJson(dutyStateFile, {})
             const windows = { ...(st.windows || {}) }
             delete windows[windowKey]
             // ⭐ 重试要有节流：不加这条的话，若连兜底模型都跑不了，就会每 60 秒起一轮、无限循环
             bumpState({ windows, count: Math.max(0, roundsToday() - 1), configDeadUntil: Date.now() + 10 * 60_000 })
-            log(`这一轮死在配置错（${line.slice(0, 120)}）⇒ 窗口「${windowKey}」退回，10 分钟后换模型重试`)
+            log(`这一轮死在${isAuth ? '凭证错' : '配置错'}（${line.slice(0, 120)}）⇒ 窗口「${windowKey}」退回，10 分钟后换模型重试`)
           }
         }
       } catch (e) { log(`判断这一轮是不是配置错时出错（不影响收尾）：${e?.message ?? e}`) }

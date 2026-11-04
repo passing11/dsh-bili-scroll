@@ -1,3 +1,38 @@
+## 2.4.8 — 2026-11-04
+
+### 修：凭证被上游拒时也当"配置错"处理（不然窗口白烧、还不换模型）
+
+**现象**：2026-11-04 那天的两轮都失败，其中夜里那一轮 11 秒就退出、`code=1`：
+
+```
+dsh: AUTH: 401: {"message":"{\"code\":1001,\"message\":\"We're sorry, but we are not able to
+authenticate you...\"} (every remaining pooled account is excluded (unavailable,
+credential-rejected))","type":"authentication","code":"authentication"}
+```
+
+两个 trae 账号一个 `credential-rejected`、一个 `unavailable`（`transport error: fetch failed`），
+token 本身没过期（`exp` 还在 11-07 / 11-10）—— 是服务端拒的。
+
+**根因**：2.4.6 的"配置错"判定只认 `UNKNOWN_MODEL` / `NO_ADAPTER`。
+凭证类失败（`AUTH: 401` / `credential-rejected` / `not able to authenticate`）同样死在第一个请求前，
+却**不进**这个判定 ⇒ ① 当天的谷时窗口被标记成"跑过了"，白天再也不重试；② 不记坏模型，
+下次还是原样撞上去。使用者看到的仍然是"不会自动刷"。
+
+**修法**：
+- 判定正则扩成 `UNKNOWN_MODEL|NO_ADAPTER|AUTH:\s*401|credential-rejected|not able to authenticate`；
+- 错误行同样精确抠出 `AUTH: …` 那一行写进日志；
+- 窗口退回 + `configDeadUntil` 重试节流照旧（10 分钟后换模型重试）。
+
+### 修：凭证类失败的封禁期只 30 分钟，不学"模型没了"封 7 天
+
+`state.badModels` 的条目现在**可以带自己的 `ttl`**（毫秒），`badModelOf()` 读不到就退回默认的 7 天。
+凭证被拒是**账号层面**的事 —— 重新登录、风控过期都会自己恢复，封 7 天等于让使用者换回账号也要等一周。
+所以 `AUTH` 类只封 30 分钟。
+
+### 顺带
+
+- 日志文案区分开：`这一轮死在凭证错（…）⇒ 窗口「…」退回` / `这一轮死在配置错（…）⇒ …`，
+  看一眼日志就知道是账号的问题还是模型的问题。
 ## 2.4.7 — 2026-11-03
 
 ### 修：日报正文被宿主自己切掉了（长期存在，六份报告全中）
