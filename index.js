@@ -1344,8 +1344,27 @@ function reportMeta() {
   // ⭐ 私信默认化（2026-10-21）：用户常常只填了「@ 谁」的昵称、没填 UID
   //    ⇒ 我们按昵称替他查一次 mid 并缓存；**查不到就降级回只发评论**（绝不能"默认私信"却一条都送不出去 ✗）
   let dmUidCache = 0
+  // ⭐ 2.4.9：自动轮和 `bili_run` 工具都走 runDuty()，**不经过**设置页那个 `POST /api/bili-duty/run`，
+  //    而预热以前只挂在那条 POST 上 ⇒ 自动轮里 dmUidCache 一直是 0 ⇒ 每轮降级成
+  //    「⛔ 这一轮什么都不会发出去 ⇒ 只会写报告」⇒ 用户只看到报告、收不到私信 ✗
+  //    ⇒ 补一条**纯本地、同步**的兜底：直接吃 uid-cache.json（resolveUid 查过一次就会写它）。
+  //      填了「@ 谁」且查过一次之后，自动轮也能投递，而且不依赖网络。
+  const cachedDmUid = () => {
+    const name = String(cfg.mentionName || '').trim()
+    if (!name) return 0
+    try {
+      const cache = JSON.parse(readFileSync(join(stateDir, 'uid-cache.json'), 'utf8')) || {}
+      if (Number(cache[name]) > 0) return Number(cache[name])
+      for (const [k, v] of Object.entries(cache)) if (String(k) === name && Number(v) > 0) return Number(v)
+    } catch { /* 没缓存就 0 */ }
+    return 0
+  }
   async function warmDmUid() {
     if (Number(cfg.dmUid) > 0) return Number(cfg.dmUid)
+    if (dmUidCache > 0) return dmUidCache
+    // ⭐ 2.4.9：先把本地缓存认下来（不联网、不依赖 dmMode 判据），再决定要不要去查接口
+    const local = cachedDmUid()
+    if (local > 0) { dmUidCache = local; return local }
     if (cfg.dmMode === 'off') return 0
     const name = String(cfg.mentionName || '').trim()
     if (!name) return 0
@@ -1354,6 +1373,14 @@ function reportMeta() {
       if (mid > 0) { dmUidCache = mid; log(`私信对象：${name} → ${mid}`) }
       return mid
     } catch (e) { log('查私信 UID 出错：' + String(e?.message ?? e)); return 0 }
+  }
+  /** 同步版：给 runDuty / promptFor 这种不方便 await 的地方用（只认已缓存的结果） */
+  const warmDmUidSync = () => {
+    if (Number(cfg.dmUid) > 0) return Number(cfg.dmUid)
+    if (dmUidCache > 0) return dmUidCache
+    const local = cachedDmUid()
+    if (local > 0) dmUidCache = local
+    return dmUidCache
   }
 
   const promptFor = (why = 'auto') => {
@@ -2160,6 +2187,19 @@ function reportMeta() {
         dutyChild = null
       }
     refreshCfg()          // ⭐ 设置页刚改过的值要立刻生效（config 是就地改的，快照会过期）
+    // ⭐ 2.4.9：**每一轮开跑前都先认一次收件人**（只吃本地 uid-cache.json，不联网、不阻塞）
+    //    以前预热只挂在 `POST /api/bili-duty/run` 上 ⇒ 自动轮 / bili_run 工具走 runDuty 这条路时
+    //    dmUidCache 是 0 ⇒ 整轮降级成「什么都不会发出去，只会写报告」✗
+    try {
+      const before = dmUidCache
+      warmDmUidSync()
+      if (!before && dmUidCache > 0) log(`私信收件人：${String(cfg.mentionName || '').trim()} → ${dmUidCache}（本地缓存，这一轮可以投递了）`)
+      else if (!dmUidCache && String(cfg.dmMode || 'off') !== 'off') log(`私信收件人还没定（「@ 谁」=${String(cfg.mentionName || '').trim() || '空'}，uid-cache.json 里没查到）⇒ 这一轮只能写报告`)
+      // 缓存里也没有 ⇒ 后台查一次接口（**不等它**，这一轮照跑；查到了下一轮就能投）
+      if (!dmUidCache && String(cfg.dmMode || 'off') !== 'off' && String(cfg.mentionName || '').trim()) {
+        warmDmUid().then((mid) => { if (mid > 0) log(`私信收件人已查到：${String(cfg.mentionName || '').trim()} → ${mid}（下一轮开始就能投递）`) }).catch(() => { /* 查不到就算了 */ })
+      }
+    } catch { /* 认不出来也不拦路 */ }
     const dsh = resolveDsh()
     // ⭐ 找不到 dsh 就别硬跑：以前会退化成裸 `dsh` ⇒ spawn 失败、只留 exit 1 + 一串乱码 ✗
     if (dsh.missing) {
